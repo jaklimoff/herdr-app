@@ -71,12 +71,35 @@ pub enum TerminalEvent {
     Peek(String),
     TitleChanged,
     SelectionChanged,
+    /// History scroll position changed enough for mods that watch `panes().scroll`.
+    ScrollChanged,
     /// The program ended.
     Ended,
     /// Right-click where the program doesn't take the mouse: the pane menu.
     ContextMenu(Point<Pixels>),
     /// Something the person asked for failed: an error toast.
     Notice { title: String, body: String },
+}
+
+/// Rows of scrollback history as Ghostty's scrollbar reports them. `from_bottom`
+/// is 0 when the viewport is at (or past) the end; absent on the alternate screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollMetrics {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub from_bottom: u64,
+}
+
+impl ScrollMetrics {
+    pub fn json(self) -> Value {
+        json!({
+            "total": self.total,
+            "offset": self.offset,
+            "len": self.len,
+            "from_bottom": self.from_bottom,
+        })
+    }
 }
 
 /// What the canvas closures need, shared outside the entity so prepaint can resize.
@@ -157,6 +180,8 @@ pub struct TerminalView {
     pending_search_nav: Option<bool>,
     search_task: Option<Task<()>>,
     attach_deadline: Instant,
+    /// Last observed distance; output only publishes transitions to/from the end.
+    published_from_bottom: Option<u64>,
     _render_hold: Option<(Instant, Task<()>)>,
     _reader: Option<Task<()>>,
 }
@@ -317,6 +342,7 @@ impl TerminalView {
             pending_search_nav: None,
             search_task: None,
             attach_deadline,
+            published_from_bottom: None,
             _render_hold: None,
             _reader: None,
         };
@@ -583,6 +609,7 @@ impl TerminalView {
                 });
             })));
         }
+        self.publish_scroll_if_changed(false, cx);
         // Output in a terminal nobody sees doesn't redraw the window; it's
         // drawn fresh when shown again. Nor does output that changed nothing
         // on screen (an agent spinning its title).
@@ -824,6 +851,7 @@ impl TerminalView {
         }
         drop(grid);
         self.selection_changed(cx);
+        self.publish_scroll_if_changed(true, cx);
         self.copy_primary(cx);
         cx.notify();
         Ok(())
@@ -1001,6 +1029,8 @@ impl TerminalView {
         } else {
             g.vt.scroll_viewport(if up { -(n as isize) } else { n as isize });
         }
+        drop(g);
+        self.publish_scroll_if_changed(true, cx);
         cx.notify();
     }
 
@@ -1014,7 +1044,34 @@ impl TerminalView {
             ScrollTarget::Top => g.vt.scroll_to_top(),
             ScrollTarget::Bottom => g.vt.scroll_to_bottom(),
         }
+        drop(g);
+        self.publish_scroll_if_changed(true, cx);
         cx.notify();
+    }
+
+    /// History scroll metrics for mods (`panes().scroll`). None on the alternate screen.
+    pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
+        let g = self.grid.borrow();
+        if g.vt.alt_screen() {
+            return None;
+        }
+        let sb = g.vt.scrollbar();
+        let from_bottom = sb.total.saturating_sub(sb.offset.saturating_add(sb.len));
+        Some(ScrollMetrics { total: sb.total, offset: sb.offset, len: sb.len, from_bottom })
+    }
+
+    fn publish_scroll_if_changed(&mut self, user_scroll: bool, cx: &mut Context<Self>) {
+        let from_bottom = self.scroll_metrics().map(|m| m.from_bottom);
+        let previous = self.published_from_bottom;
+        self.published_from_bottom = from_bottom;
+        let changed = if user_scroll {
+            from_bottom != previous
+        } else {
+            from_bottom.map(|n| n > 0) != previous.map(|n| n > 0)
+        };
+        if changed {
+            cx.emit(TerminalEvent::ScrollChanged);
+        }
     }
 
     /// The program tracks the mouse and Shift isn't held (Shift keeps the mouse Herdr's).
@@ -1100,6 +1157,7 @@ impl TerminalView {
                         g.vt.scroll_viewport(lines);
                         drop(g);
                         this.select(Select::Drag, this.selection_pointer, cx);
+                        this.publish_scroll_if_changed(true, cx);
                     }
                     true
                 }).unwrap_or(false);
@@ -2339,6 +2397,7 @@ impl EntityInputHandler for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.publish_scroll_if_changed(false, cx);
         crate::bench::count(&crate::bench::TERMINAL);
         let terminal_focused = self.focus.is_focused(window);
         if terminal_focused {
@@ -2453,6 +2512,7 @@ impl Render for TerminalView {
                         g.vt.scroll_to_row(scrollbar_row_at(sb.total, sb.len, f32::from(track.size.height), min, top));
                     }
                     drop(g);
+                    this.publish_scroll_if_changed(true, cx);
                     cx.notify();
                     cx.stop_propagation();
                     return;
@@ -2520,6 +2580,7 @@ impl Render for TerminalView {
                                         let top = f32::from(ev.position.y - g.origin.y) - this.scrollbar_grab.unwrap_or(0.0);
                                         g.vt.scroll_to_row(scrollbar_row_at(sb.total, sb.len, track, min, top));
                                         drop(g);
+                                        this.publish_scroll_if_changed(true, cx);
                                         cx.notify();
                                         return;
                                     }
@@ -2671,6 +2732,15 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[test]
+    fn scroll_from_bottom_is_zero_at_end_and_grows_into_history() {
+        let at_end = |total: u64, offset: u64, len: u64| total.saturating_sub(offset.saturating_add(len));
+        assert_eq!(at_end(100, 80, 20), 0);
+        assert_eq!(at_end(100, 70, 20), 10);
+        assert_eq!(at_end(20, 0, 20), 0);
+        assert_eq!(at_end(100, 0, 20), 80);
+    }
 
     #[test]
     fn output_turns_preserve_bytes_budget_and_close_order() {
