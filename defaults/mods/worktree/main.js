@@ -29,7 +29,7 @@ const tilde = (path, userHome) => {
 };
 const slug = (branch) => {
   const normalized = branch.normalize("NFC");
-  const name = normalized.replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "");
+  const name = normalized.replace(/[^\p{L}\p{M}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "");
   if (name) return name;
   // Hash the original name so symbol-only branches do not share a folder.
   let hash = 2166136261;

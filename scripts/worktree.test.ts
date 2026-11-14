@@ -113,6 +113,10 @@ for (const on of [undefined, null, "server"]) {
 
 for (const [branch, folder] of [
   ["음악수행", "음악수행"], ["쪼지학", "쪼지학"],
+  ["हिन्दी", "हिन्दी"], ["हिंदी", "हिंदी"],
+  ["का", "का"], ["कि", "कि"],
+  ["বাংলা", "বাংলা"],
+  ["feature/हिन्दी", "feature-हिन्दी"],
   ["feature/음악수행-１２٣", "feature-음악수행-１２٣"],
   ["음악수행".normalize("NFD"), "음악수행"],
   ["feature/ASCII_1.2--fix", "feature-ASCII_1.2--fix"],
